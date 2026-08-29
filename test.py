@@ -466,6 +466,7 @@ def _rand_like(key, x, scale=1.0):
     return jax.random.normal(key, x.shape, dtype=jnp.float32) * scale
 
 
+
 def test_backward_B1(config: KernelConfig, seed=10):
     """B1 = gdn2_dhu_backward: reverse-scan adjoint of the inter-chunk
     state recurrence. Cross-check against jax.vjp on
@@ -479,17 +480,17 @@ def test_backward_B1(config: KernelConfig, seed=10):
     Aqk, Akk = fwdmod.build_chunk_scores_pallas(q, k, b, g, scale=1.0, config=config)
     A = fwdmod.wy_solve_pallas(Akk, config=config)
     w_pseudo, u, kg, qg, gc_last = fwdmod.recompute_wy_pallas(q, k, v, w, b, g, A, config=config)
-
+ 
     def fwd_fn(w_pseudo_, u_, kg_, qg_, gc_last_):
         o, h_final = fwdmod.gdn2_inter_chunk_combine(Aqk, w_pseudo_, u_, kg_, qg_, gc_last_, scale=1.0, config=config)
         return o, h_final
-
+ 
     (o0, h_final0), vjp_fn = jax.vjp(fwd_fn, w_pseudo, u, kg, qg, gc_last)
     k2 = jax.random.split(key, 2)
     do = _rand_like(k2[0], o0, 0.1)
     dh_final = _rand_like(k2[1], h_final0, 0.1)
     dw_pseudo_ref, du_ref, dkg_ref, dqg_ref, dgc_last_ref = vjp_fn((do, dh_final))
-
+ 
     # ФИКС (был баг предыдущей версии теста): B1 (gdn2_dhu_backward) не
     # принимает "сырой" do напрямую -- по контракту (см. само B1's own
     # signature / его вызов в kernel_trainable_B6.py's _gdn2_core_bwd)
@@ -504,22 +505,30 @@ def test_backward_B1(config: KernelConfig, seed=10):
     # do в chunk-layout, прогнать через dav_backward_pallas (B2), и ТОЛЬКО
     # ПОТОМ передать результат в B1 -- ровно так, как это делает
     # kernel_trainable_B6.py в реальном pipeline.
+    # v_new_all -- нужен dav_backward_pallas (B2) как реальный forward-residual
+    # (в chunk-layout (bsz,H,n_chunks,BT,D), то же, что возвращает
+    # gdn2_inter_chunk_combine_with_state). Прошлая версия теста ссылалась на
+    # v_new_all, ни разу не вычислив его в этой функции -- отсюда NameError.
+    _, _h_final_ws, _h_pre_all, v_new_all = fwdmod.gdn2_inter_chunk_combine_with_state(
+        Aqk, w_pseudo, u, kg, qg, gc_last, scale=1.0, config=config
+    )
+ 
     do_r = jnp.moveaxis(do.reshape(bsz, n_chunks, config.bt, H, D), (1, 3), (2, 1))
     _, dv_partial_from_b2 = bwdmod.dav_backward_pallas(Aqk, v_new_all, do_r, config=config)
-
+ 
     # B1 only produces dh_all/dh0/dv_all (state-side adjoints) -- it does
     # NOT directly return dw_pseudo/du/dkg/dqg (those come from B2/B3
     # downstream in the real pipeline). To isolate B1, check the STATE
     # recursion adjoint dh0 against jax.vjp w.r.t. an explicit h0 input.
     h0 = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
-
+ 
     def fwd_fn_h0(h0_):
         o, h_final = fwdmod.gdn2_inter_chunk_combine(Aqk, w_pseudo, u, kg, qg, gc_last, scale=1.0, h0=h0_, config=config)
         return o, h_final
-
+ 
     (o1, h_final1), vjp_fn_h0 = jax.vjp(fwd_fn_h0, h0)
     (dh0_ref,) = vjp_fn_h0((do, dh_final))
-
+ 
     # Now call B1 with the CORRECT dv_partial and check dh0 matches.
     dh_all, dh0_kernel, dv_all = bwdmod.gdn2_dhu_backward(
         do_r, dv_partial_from_b2, w_pseudo, qg, kg, gc_last, scale=1.0, dht=dh_final,
@@ -533,7 +542,7 @@ def test_backward_B1(config: KernelConfig, seed=10):
     if rel > 0.05:
         ok = False
         print("  !! B1 dh0 diverges from jax.vjp reference by >5% -- investigate.")
-
+ 
     print(f"BACKWARD B1 RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
