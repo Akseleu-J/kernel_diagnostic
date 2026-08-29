@@ -1088,7 +1088,7 @@ RUN_CONFIG = {
     # ИГНОРИРУЮТСЯ. Поставьте SCENARIO=None, чтобы использовать свои
     # значения вручную.
     "SCENARIO": None,
-    "LIVE_STEPS": 300,
+    "LIVE_STEPS": 1500,
     "LIVE_LR": 3e-3,
     "LIVE_USE_CLIP": True,
     "LIVE_USE_NAN_GUARD": True,
