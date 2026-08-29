@@ -480,7 +480,7 @@ def test_backward_B1(config: KernelConfig, seed=10):
     Aqk, Akk = fwdmod.build_chunk_scores_pallas(q, k, b, g, scale=1.0, config=config)
     A = fwdmod.wy_solve_pallas(Akk, config=config)
     w_pseudo, u, kg, qg, gc_last = fwdmod.recompute_wy_pallas(q, k, v, w, b, g, A, config=config)
- 
+  
     def fwd_fn(w_pseudo_, u_, kg_, qg_, gc_last_):
         o, h_final = fwdmod.gdn2_inter_chunk_combine(Aqk, w_pseudo_, u_, kg_, qg_, gc_last_, scale=1.0, config=config)
         return o, h_final
