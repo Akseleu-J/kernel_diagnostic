@@ -211,20 +211,23 @@ def run_grid_part1(cfg):
     seeds = cfg["seeds"]
     decay_scales = cfg["decay_scales"]
     bt_values = cfg["bt_values"]
-    bc_divisors = cfg["bc_divisors"]
 
+    # FIX: bc/mb НЕ влияют на cond(Akk) вообще (подтверждено дважды --
+    # исходная Часть 1 и повторная Часть 3 после fix'а bt==2*bc) --
+    # cond(Akk) свойство Kernel A, решателя (Kernel B) не касается.
+    # Раньше здесь перебирались bc_divisors независимо от bt, что могло
+    # породить невалидные точки (bc==bt, а не bt/2), которые потом
+    # попадали в Часть 2 и падали с AssertionError. bc теперь жёстко
+    # bt//2 (единственное валидное значение для Kernel B), mb фиксирован
+    # на 16 -- варьировать mb отдельно, если нужно, это задача Часть 3.
     grid_points = []
     for bt in bt_values:
         assert seq_len % bt == 0, f"seq_len={seq_len} must be divisible by bt={bt}"
-        for bc in bc_divisors:
-            if bt % bc != 0:
-                continue
-            mb = min(16, bc)
-            if bc % mb != 0:
-                continue
-            grid_points.append(GridPoint(bt=bt, bc=bc, mb=mb))
+        bc = bt // 2
+        mb = min(16, bc)
+        grid_points.append(GridPoint(bt=bt, bc=bc, mb=mb))
 
-    print(f"[GRID] Всего точек сетки (bt,bc): {len(grid_points)}")
+    print(f"[GRID] Всего точек сетки (bt): {len(grid_points)}")
     for gp in grid_points:
         print(f"  bt={gp.bt} bc={gp.bc} mb={gp.mb}")
 
