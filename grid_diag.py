@@ -486,7 +486,7 @@ def run_part2_train_check(cfg, candidates):
     только сравнение bt/bc при прочих равных (без centering/xavier/fp32
     decay, чтобы изолировать именно эффект bt/bc)."""
     from flax import linen as nn
-    from atomic_ops.gdn2_pipeline import gdn2_pallas_forward_trainable
+    from Atomic_ops.gdn2_pipeline import gdn2_pallas_forward_trainable
     import numpy as np
 
     n_heads = cfg["n_heads"]
