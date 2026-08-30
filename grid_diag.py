@@ -46,8 +46,8 @@ import time
 import jax
 import jax.numpy as jnp
 
-from atomic_ops.configs import KernelConfig
-from atomic_ops.gdn2_fwd import build_chunk_scores_pallas
+from Atomic_ops.configs import KernelConfig
+from Atomic_ops.gdn2_fwd import build_chunk_scores_pallas
 
 
 # ==========================================================================
