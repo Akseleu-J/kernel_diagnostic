@@ -47,7 +47,7 @@ import jax
 import jax.numpy as jnp
 
 from Atomic_ops.configs import KernelConfig
-from Atomic_ops.gdn2_fwd import build_chunk_scores_pallas
+from Atomic_ops.gdn2_fwd import build_chunk_scores_pallas, wy_solve_pallas
 
 
 # ==========================================================================
@@ -287,6 +287,206 @@ def run_grid_part1(cfg):
 
 
 # ==========================================================================
+# Часть 1b: ось decay_a_init -- проверка гипотезы "decay_a инициализирован
+# в 0.0 (model.py's nn.initializers.zeros) -> g~=0 на первом шаге -> Akk
+# в самом плохом (наименее демпфированном decay'ем) режиме именно в
+# момент старта обучения". В отличие от Части 1 (decay_scale двигает
+# РАЗБРОС log-decay между токенами), здесь мы напрямую имитируем реальный
+# a_param = self.param("decay_a", zeros, ...) со СКАЛЯРНЫМ сдвигом
+# a_param_init -- т.е. тот же decay-масштаб, что реально задаёт
+# model.py::GatedDeltaNet2J при a_param_init != 0 вместо инициализации в 0.
+# ==========================================================================
+def _make_fixed_inputs_with_decay_a(seed, bsz, seq_len, n_heads, d_head, a_param_init, f_proj_scale=0.5):
+    """Имитирует РЕАЛЬНУЮ формулу из model.py::GatedDeltaNet2J:
+        g = -exp(clip(a_param,-20,20)) * softplus(f_proj)
+    вместо искусственного decay_scale*|normal| из _make_fixed_inputs.
+    a_param_init -- то самое значение, в которое СЕЙЧАС инициализируется
+    decay_a (nn.initializers.zeros -> 0.0); мы проверяем альтернативные
+    инициализации (например, -2.0) вместо изменения кода модели напрямую."""
+    key = jax.random.PRNGKey(seed)
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    shape = (bsz, seq_len, n_heads, d_head)
+
+    q = jax.random.normal(k1, shape)
+    k = jax.random.normal(k2, shape)
+    q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-6)
+    k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
+
+    b = jax.random.uniform(k3, shape, minval=0.2, maxval=1.0)
+
+    # f_proj -- имитация выхода decay_proj Dense-слоя на случайных весах
+    # при случайном входе; масштаб f_proj_scale~0.5 -- типичный масштаб
+    # выхода Dense со стандартной lecun_normal-инициализацией на
+    # нормализованном входе (не точная копия, но достаточно для сравнения
+    # РАЗНИЦЫ между a_param_init, при фиксированном f_proj_scale).
+    f_proj = jax.random.normal(k4, shape) * f_proj_scale
+
+    a_safe = jnp.clip(jnp.asarray(a_param_init, dtype=jnp.float32), -20.0, 20.0)
+    g = -jnp.exp(a_safe) * jax.nn.softplus(f_proj)
+    g = jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=-20.0)
+
+    return q, k, b, g
+
+
+def run_grid_part1b_decay_init(cfg):
+    """Фиксирует bt/bc на разумном дефолте (берётся из cfg) и меняет ТОЛЬКО
+    a_param_init -- прямая проверка "стоит ли менять инициализацию decay_a
+    с 0.0 на что-то отрицательное", независимо от вопроса BT/BC из Части 1.
+    """
+    bsz = cfg["bsz"]
+    seq_len = cfg["seq_len"]
+    n_heads = cfg["n_heads"]
+    d_head = cfg["d_head"]
+    seeds = cfg["seeds"]
+    bt = cfg["decay_init_probe_bt"]
+    bc = cfg["decay_init_probe_bc"]
+    a_param_inits = cfg["decay_a_init_values"]
+
+    config = KernelConfig(bt=bt, bc=bc, mb=min(16, bc), use_centering=False, wy_eps=0.0)
+    results = []
+
+    print(f"[GRID-1b] Проба decay_a_init при фиксированных bt={bt}, bc={bc}")
+    for a_init in a_param_inits:
+        per_seed_stats = []
+        for seed in seeds:
+            q, k, b, g = _make_fixed_inputs_with_decay_a(seed, bsz, seq_len, n_heads, d_head, a_init)
+            Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale=1.0, config=config, interpret=True)
+            max_cond, mean_cond, median_cond, max_sigma, min_sigma = _akk_condition_stats(Akk)
+            per_seed_stats.append({
+                "seed": seed, "max_cond": max_cond, "mean_cond": mean_cond,
+                "median_cond": median_cond,
+            })
+
+        agg_max_cond = max(s["max_cond"] for s in per_seed_stats)
+        agg_mean_cond = sum(s["mean_cond"] for s in per_seed_stats) / len(per_seed_stats)
+        entry = {
+            "a_param_init": a_init,
+            "effective_decay_scale": float(jnp.exp(jnp.clip(jnp.asarray(a_init, jnp.float32), -20.0, 20.0))),
+            "agg_max_cond": agg_max_cond, "agg_mean_cond": agg_mean_cond,
+            "per_seed": per_seed_stats,
+        }
+        results.append(entry)
+        print(f"    decay_a_init={a_init:+.2f} (effective decay scale={entry['effective_decay_scale']:.4f}) "
+              f"-> max_cond={agg_max_cond:.3e}  mean_cond={agg_mean_cond:.3e}")
+
+    results_sorted = sorted(results, key=lambda r: r["agg_max_cond"])
+    print("\n[GRID-1b] Лучшие decay_a_init по agg_max_cond:")
+    for r in results_sorted[:5]:
+        print(f"    decay_a_init={r['a_param_init']:+.2f} -> max_cond={r['agg_max_cond']:.3e}")
+
+    return results
+
+
+# ==========================================================================
+# Часть 3: точность WY-решателя (wy_solve_pallas) как функция BC, ПРИ
+# ФИКСИРОВАННОЙ плохо обусловленной Akk. Часть 1 показала, что BC не влияет
+# на саму cond(Akk) (это ожидаемо -- Akk не зависит от того, как её потом
+# инвертируют), но НЕ проверяла, влияет ли BC на ТОЧНОСТЬ самого forward
+# substitution при инвертировании ОДНОЙ И ТОЙ ЖЕ плохо обусловленной Akk --
+# это отдельный, более узкий вопрос про численную устойчивость решателя,
+# а не про геометрию входа.
+#
+# Эталон A_exact строится через Neumann-ряд высокого порядка (не
+# jnp.linalg.inv/solve -- та же защита от сломанного scipy/LAPACK на этом
+# окружении, что и в _akk_condition_stats), и точность решателя измеряется
+# как ||I - (I+Akk)@A||_F относительно этого эталона.
+# ==========================================================================
+def _reference_inverse_neumann(Akk, iters=200):
+    """(I+T)^{-1} через ряд Неймана sum_k (-T)^k -- T строго нижняя
+    треугольная (nilpotent при конечном BT), поэтому ряд ТОЧНО обрывается
+    на T^BT=0 и iters>=BT гарантирует точный результат (не приближение) --
+    в отличие от _neumann_min_sigma_proxy выше (та функция для ОБЩЕЙ
+    Akk-подобной матрицы, здесь -- специально для строго нижней
+    треугольной T, где ряд действительно конечен)."""
+    n = Akk.shape[-1]
+    eye = jnp.eye(n, dtype=Akk.dtype)[None]
+    acc = eye
+    term = eye
+    for _ in range(min(iters, n)):
+        term = jnp.einsum("nij,njk->nik", term, -Akk)
+        acc = acc + term
+    return acc
+
+
+def run_part3_bc_solver_accuracy(cfg):
+    """Строит ОДНУ плохо обусловленную Akk (bt=256, decay_scale=0.0 --
+    худший случай из Части 1) и гоняет wy_solve_pallas с разным bc на ЭТОЙ
+    ЖЕ Akk, сравнивая результат с точным эталоном (Neumann-ряд, обрывается
+    точно при iters>=BT -- см. _reference_inverse_neumann). Метрика:
+    ||I - (I+Akk)@A_pallas||_F -- НЕ ||A_pallas - A_exact||_F напрямую,
+    т.к. при большом cond(Akk) сами элементы A могут быть огромны и
+    маленькая относительная ошибка в A даёт большую абсолютную разницу
+    -- невязка (I+Akk)@A относительно I содержательнее для "насколько
+    решение годится downstream" (ровно то, что реально используется в
+    forward: w_pseudo = A @ kb_decayed и т.п.)."""
+    bsz = cfg["bsz"]
+    seq_len = cfg["seq_len"]
+    n_heads = cfg["n_heads"]
+    d_head = cfg["d_head"]
+    bt = cfg["part3_bt"]
+    bc_values = cfg["part3_bc_values"]
+    seed = cfg["part3_seed"]
+
+    q, k, b, g = _make_fixed_inputs(seed, bsz, seq_len, n_heads, d_head, decay_scale=0.0)
+
+    # Akk сама по себе НЕ зависит от bc -- строим её один раз с любым
+    # валидным bc (bt должен делиться на bc; берём максимальный из
+    # bc_values как "нейтральный" для построения самой Akk).
+    probe_bc = max(b_ for b_ in bc_values if bt % b_ == 0)
+    probe_config = KernelConfig(bt=bt, bc=probe_bc, mb=min(16, probe_bc), use_centering=False, wy_eps=0.0)
+    _Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale=1.0, config=probe_config, interpret=True)
+
+    flat_Akk = Akk.astype(jnp.float32).reshape(-1, Akk.shape[-2], Akk.shape[-1])
+    A_exact = _reference_inverse_neumann(flat_Akk, iters=bt)
+
+    n = flat_Akk.shape[-1]
+    eye = jnp.eye(n, dtype=jnp.float32)[None]
+
+    resid_exact = jnp.einsum("nij,njk->nik", eye + flat_Akk, A_exact) - eye
+    resid_exact_norm = float(jnp.max(jnp.linalg.norm(resid_exact.reshape(resid_exact.shape[0], -1), axis=-1)))
+    print(f"[GRID-3] Эталонная невязка (Neumann, iters={bt}, sanity-check -- должна быть ~0): "
+          f"{resid_exact_norm:.3e}")
+
+    results = []
+    print(f"[GRID-3] Точность wy_solve_pallas по BC при фиксированной bt={bt}, decay_scale=0.0 (худший случай)")
+    for bc in bc_values:
+        if bt % bc != 0:
+            print(f"    bc={bc}: пропущено (bt={bt} не делится нацело)")
+            continue
+        mb = min(16, bc)
+        if bc % mb != 0:
+            print(f"    bc={bc}: пропущено (bc не делится на mb={mb})")
+            continue
+
+        config = KernelConfig(bt=bt, bc=bc, mb=mb, use_centering=False, wy_eps=0.0)
+        t0 = time.time()
+        A_pallas = wy_solve_pallas(Akk, config)
+        elapsed = time.time() - t0
+
+        flat_A_pallas = A_pallas.astype(jnp.float32).reshape(-1, n, n)
+        resid = jnp.einsum("nij,njk->nik", eye + flat_Akk, flat_A_pallas) - eye
+        resid_norm_per_chunk = jnp.linalg.norm(resid.reshape(resid.shape[0], -1), axis=-1)
+        max_resid = float(jnp.max(resid_norm_per_chunk))
+        mean_resid = float(jnp.mean(resid_norm_per_chunk))
+
+        diff_vs_exact = flat_A_pallas - A_exact
+        max_abs_diff_vs_exact = float(jnp.max(jnp.abs(diff_vs_exact)))
+
+        entry = {
+            "bc": bc, "mb": mb,
+            "max_residual_norm": max_resid, "mean_residual_norm": mean_resid,
+            "max_abs_diff_vs_exact": max_abs_diff_vs_exact,
+            "elapsed_s": elapsed,
+        }
+        results.append(entry)
+        print(f"    bc={bc:4d} mb={mb:2d} -> max||I-(I+Akk)@A||={max_resid:.3e}  "
+              f"mean_resid={mean_resid:.3e}  max|diff vs exact|={max_abs_diff_vs_exact:.3e}  "
+              f"({elapsed:.2f}s)")
+
+    return {"reference_sanity_residual": resid_exact_norm, "by_bc": results}
+
+
+# ==========================================================================
 # Часть 2 (опциональная, требует TPU): короткий train-прогон реального
 # Pallas-кернела (interpret=False) для лучших кандидатов из Части 1 --
 # подтверждает, что снижение cond(Akk) реально даёт лучший
@@ -489,6 +689,18 @@ RUN_CONFIG = dict(
     decay_scales=[0.0, 0.05],        # 0.0 = самое начало обучения (decay_a=0)
     seeds=[0, 1, 2],                 # усреднение/max по нескольким seed
 
+    # ---- Часть 1b: ось decay_a_init (проверка альтернативной
+    # инициализации decay_a вместо nn.initializers.zeros в model.py) ----
+    decay_init_probe_bt=256,
+    decay_init_probe_bc=128,
+    decay_a_init_values=[0.0, -0.5, -1.0, -1.5, -2.0, -3.0],
+
+    # ---- Часть 3: точность wy_solve_pallas по BC на фиксированной
+    # плохо обусловленной Akk (bt=part3_bt, decay_scale=0.0) ----
+    part3_bt=256,
+    part3_bc_values=[128, 64, 32, 16],
+    part3_seed=0,
+
     # ---- Часть 2 (короткий train check на реальном TPU-кернеле) ----
     run_part2_on_tpu=False,   # <-- поставьте True, только если есть TPU
     part2_top_n=3,            # сколько лучших конфигов из Части 1 проверить обучением
@@ -509,12 +721,24 @@ def main(cfg=RUN_CONFIG):
         json.dump(part1_results, f, indent=2)
     print("\n[GRID] Часть 1 сохранена в grid_condition_results_part1.json")
 
+    print("\n=== ЧАСТЬ 1b: ось decay_a_init при фиксированных bt/bc ===")
+    part1b_results = run_grid_part1b_decay_init(cfg)
+    with open("grid_condition_results_part1b_decay_init.json", "w") as f:
+        json.dump(part1b_results, f, indent=2)
+    print("[GRID] Часть 1b сохранена в grid_condition_results_part1b_decay_init.json")
+
+    print("\n=== ЧАСТЬ 3: точность wy_solve_pallas по BC на фиксированной плохой Akk ===")
+    part3_results = run_part3_bc_solver_accuracy(cfg)
+    with open("grid_condition_results_part3_bc_accuracy.json", "w") as f:
+        json.dump(part3_results, f, indent=2)
+    print("[GRID] Часть 3 сохранена в grid_condition_results_part3_bc_accuracy.json")
+
     if not cfg["run_part2_on_tpu"]:
         print("\n[GRID] run_part2_on_tpu=False -- Часть 2 (train-check на реальном "
               "TPU-кернеле) пропущена. Поставьте cfg['run_part2_on_tpu']=True и "
               "запустите на Kaggle TPU v5e-8, если результаты Части 1 выглядят "
               "многообещающе и нужно подтвердить эффект на реальном обучении.")
-        return {"part1": part1_results, "part2": None}
+        return {"part1": part1_results, "part1b": part1b_results, "part3": part3_results, "part2": None}
 
     # Берём decay_scale=0.05 (более реалистичный режим после нескольких
     # сотен шагов, не голый init) для отбора топ-кандидатов в Часть 2.
@@ -533,7 +757,7 @@ def main(cfg=RUN_CONFIG):
         json.dump(part2_results, f, indent=2)
     print("\n[GRID] Часть 2 сохранена в grid_condition_results_part2.json")
 
-    return {"part1": part1_results, "part2": part2_results}
+    return {"part1": part1_results, "part1b": part1b_results, "part3": part3_results, "part2": part2_results}
 
 
 if __name__ == "__main__":
