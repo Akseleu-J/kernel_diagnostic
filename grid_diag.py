@@ -409,33 +409,20 @@ def _reference_inverse_neumann(Akk, iters=200):
 
 
 def run_part3_bc_solver_accuracy(cfg):
-    """Строит ОДНУ плохо обусловленную Akk (bt=256, decay_scale=0.0 --
-    худший случай из Части 1) и гоняет wy_solve_pallas с разным bc на ЭТОЙ
-    ЖЕ Akk, сравнивая результат с точным эталоном (Neumann-ряд, обрывается
-    точно при iters>=BT -- см. _reference_inverse_neumann). Метрика:
-    ||I - (I+Akk)@A_pallas||_F -- НЕ ||A_pallas - A_exact||_F напрямую,
-    т.к. при большом cond(Akk) сами элементы A могут быть огромны и
-    маленькая относительная ошибка в A даёт большую абсолютную разницу
-    -- невязка (I+Akk)@A относительно I содержательнее для "насколько
-    решение годится downstream" (ровно то, что реально используется в
-    forward: w_pseudo = A @ kb_decayed и т.п.)."""
+    """bc жёстко = bt//2 (структурный инвариант Kernel B -- см.
+    atomic_ops/gdn2_fwd.py's assert bt==2*bc). Реальная ось точности
+    решателя -- mb (число микро-блоков внутри _block_solve), не bc."""
     bsz = cfg["bsz"]
     seq_len = cfg["seq_len"]
     n_heads = cfg["n_heads"]
     d_head = cfg["d_head"]
     bt = cfg["part3_bt"]
-    bc = bt // 2  # FIX: bc жёстко = bt/2 (структурный инвариант Kernel B,
-                  # см. atomic_ops/gdn2_fwd.py's assert bt==2*bc) -- реальная
-                  # ось точности решателя это mb, не bc.
+    bc = bt // 2
     mb_values = cfg["part3_mb_values"]
-    seed = cfg["part3_seed"]    seed = cfg["part3_seed"]
+    seed = cfg["part3_seed"]
 
     q, k, b, g = _make_fixed_inputs(seed, bsz, seq_len, n_heads, d_head, decay_scale=0.0)
 
-    # Akk сама по себе НЕ зависит от bc -- строим её один раз с любым
-    # валидным bc (bt должен делиться на bc; берём максимальный из
-    # bc_values как "нейтральный" для построения самой Akk).
-    probe_bc = max(b_ for b_ in bc_values if bt % b_ == 0)
     probe_config = KernelConfig(bt=bt, bc=bc, mb=min(16, bc), use_centering=False, wy_eps=0.0)
     _Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale=1.0, config=probe_config, interpret=True)
 
@@ -451,10 +438,10 @@ def run_part3_bc_solver_accuracy(cfg):
           f"{resid_exact_norm:.3e}")
 
     results = []
-    print(f"[GRID-3] Точность wy_solve_pallas по BC при фиксированной bt={bt}, decay_scale=0.0 (худший случай)")
+    print(f"[GRID-3] Точность wy_solve_pallas по MB при фиксированных bt={bt}, bc={bc}, decay_scale=0.0 (худший случай)")
     for mb in mb_values:
         if bc % mb != 0:
-            print(f"    bc={bc}: пропущено (bc не делится на mb={mb})")
+            print(f"    mb={mb}: пропущено (bc={bc} не делится на mb)")
             continue
 
         config = KernelConfig(bt=bt, bc=bc, mb=mb, use_centering=False, wy_eps=0.0)
